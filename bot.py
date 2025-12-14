@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import uuid
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -11,16 +10,29 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client
 
 # ======================
-# 🔐 ЗАГРУЗКА НАСТРОЕК
+# 🔐 ЗАГРУЗКА ПЕРЕМЕННЫХ
 # ======================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
+API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
-PHONE_NUMBER = os.getenv("PHONE_NUMBER")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID"))
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+
+if not all([BOT_TOKEN, API_ID, API_HASH, ADMIN_USER_ID]):
+    raise ValueError("❌ Отсутствуют переменные окружения: BOT_TOKEN, API_ID, API_HASH, ADMIN_USER_ID")
+
+API_ID = int(API_ID)
+ADMIN_USER_ID = int(ADMIN_USER_ID)
 
 TASKS_FILE = "tasks.json"
+SESSION_FILE = "ronibot.session"
+
+# Проверяем, существует ли сессия
+if not os.path.exists(SESSION_FILE):
+    raise FileNotFoundError(
+        f"❌ Файл сессии '{SESSION_FILE}' не найден. "
+        "Создайте его локально с помощью Pyrogram, затем загрузите в проект."
+    )
 
 # ======================
 # 🧠 ЗАГРУЗКА/СОХРАНЕНИЕ ЗАДАЧ
@@ -42,18 +54,20 @@ def save_tasks(tasks):
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Инициализируем userbot с существующей сессией
 userbot = Client(
-    "userbot_session",
+    name="sender",  # имя сессии без расширения → ищет sender.session
     api_id=API_ID,
     api_hash=API_HASH,
-    phone_number=PHONE_NUMBER
+    # phone_number НЕ указан — сессия уже авторизована!
 )
 
-# Глобальные задачи (asyncio.Task)
+# Глобальные задачи
 running_tasks = {}  # task_id -> asyncio.Task
 
 # ======================
-# 📋 FSM для создания задачи
+# 📋 FSM
 # ======================
 
 class TaskCreation(StatesGroup):
@@ -64,7 +78,7 @@ class TaskCreation(StatesGroup):
     waiting_for_count = State()
 
 # ======================
-# 🔄 ФУНКЦИЯ ОТПРАВКИ (UserBot)
+# 🔄 ФУНКЦИЯ ОТПРАВКИ
 # ======================
 
 async def send_messages_task(task_data: dict):
@@ -91,7 +105,6 @@ async def send_messages_task(task_data: dict):
                 await userbot.send_message(chat_id=chat_id, text=message)
                 sent += 1
 
-                # Обновляем счётчик
                 tasks[task_id]["sent_count"] = sent
                 save_tasks(tasks)
 
@@ -105,19 +118,17 @@ async def send_messages_task(task_data: dict):
 # ======================
 
 async def update_running_task(task_id: str):
-    # Отменяем старую задачу
     if task_id in running_tasks:
         running_tasks[task_id].cancel()
         del running_tasks[task_id]
 
-    # Запускаем новую, если активна
     tasks = load_tasks()
     task = tasks.get(task_id)
-    if task and task.get("is_active"):
+    if task and task.get("is_active") and task.get("sent_count", 0) < task.get("total_count", 0):
         running_tasks[task_id] = asyncio.create_task(send_messages_task(task))
 
 # ======================
-# 🖥️ ИНТЕРФЕЙС БОТА
+# 🖥️ КНОПКИ
 # ======================
 
 def main_menu():
@@ -135,7 +146,7 @@ def task_menu(task_id: str, is_active: bool):
     ])
 
 # ======================
-# 📡 ОБРАБОТЧИКИ
+# 📡 КОМАНДЫ И КНОПКИ
 # ======================
 
 @dp.message(Command("start"))
@@ -155,7 +166,7 @@ async def create_task_start(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(TaskCreation.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
-    await message.answer("🆔 Введите ID чата (например, -1001234567890 или 123456789):")
+    await message.answer("🆔 Введите ID чата (например, -1001234567890):")
     await state.set_state(TaskCreation.waiting_for_chat_id)
 
 @dp.message(TaskCreation.waiting_for_chat_id)
@@ -172,7 +183,7 @@ async def process_chat_id(message: types.Message, state: FSMContext):
 @dp.message(TaskCreation.waiting_for_message)
 async def process_message(message: types.Message, state: FSMContext):
     await state.update_data(message=message.text)
-    await message.answer("⏱ Введите интервал между сообщениями (в секундах, мин. 10):")
+    await message.answer("⏱ Интервал (сек, мин. 10):")
     await state.set_state(TaskCreation.waiting_for_interval)
 
 @dp.message(TaskCreation.waiting_for_interval)
@@ -182,10 +193,10 @@ async def process_interval(message: types.Message, state: FSMContext):
         if interval < 10:
             raise ValueError
     except ValueError:
-        await message.answer("🚫 Минимум 10 секунд. Попробуйте снова:")
+        await message.answer("🚫 Минимум 10 секунд.")
         return
     await state.update_data(interval=interval)
-    await message.answer("🔢 Сколько сообщений отправить (1–1000)?")
+    await message.answer("🔢 Количество сообщений (1–1000):")
     await state.set_state(TaskCreation.waiting_for_count)
 
 @dp.message(TaskCreation.waiting_for_count)
@@ -195,11 +206,12 @@ async def process_count(message: types.Message, state: FSMContext):
         if not (1 <= count <= 1000):
             raise ValueError
     except ValueError:
-        await message.answer("🚫 От 1 до 1000. Попробуйте снова:")
+        await message.answer("🚫 От 1 до 1000.")
         return
 
     data = await state.get_data()
-    task_id = str(len(load_tasks()) + 1)
+    tasks = load_tasks()
+    task_id = str(len(tasks) + 1)
 
     task = {
         "task_id": task_id,
@@ -213,16 +225,10 @@ async def process_count(message: types.Message, state: FSMContext):
         "created_at": datetime.now().isoformat()
     }
 
-    tasks = load_tasks()
     tasks[task_id] = task
     save_tasks(tasks)
-
     await state.clear()
-    await message.answer("✅ Задача создана! Вы можете включить её из списка.", reply_markup=main_menu())
-
-# ======================
-# 📋 СПИСОК ЗАДАЧ
-# ======================
+    await message.answer("✅ Задача создана!", reply_markup=main_menu())
 
 @dp.callback_query(F.data == "list_tasks")
 async def list_tasks(callback: types.CallbackQuery):
@@ -234,10 +240,8 @@ async def list_tasks(callback: types.CallbackQuery):
     text = "📋 Ваши задачи:\n\n"
     for tid, t in tasks.items():
         status = "🟢 Работает" if t["is_active"] else "⚪ Остановлена"
-        sent = t["sent_count"]
-        total = t["total_count"]
         text += f"ID: {tid} | {t['name']}\n"
-        text += f"Статус: {status} | Отправлено: {sent}/{total}\n\n"
+        text += f"Статус: {status} | Отправлено: {t['sent_count']}/{t['total_count']}\n\n"
 
     kb = [[InlineKeyboardButton(text=f"ID {tid}", callback_data=f"view_{tid}")] for tid in tasks]
     kb.append([InlineKeyboardButton(text="⬅ Назад", callback_data="main_menu")])
@@ -276,8 +280,6 @@ async def toggle_task(callback: types.CallbackQuery):
 
     tasks[task_id]["is_active"] = not tasks[task_id]["is_active"]
     save_tasks(tasks)
-
-    # Обновляем запущенную задачу
     await update_running_task(task_id)
 
     status = "включена" if tasks[task_id]["is_active"] else "отключена"
@@ -291,7 +293,6 @@ async def delete_task(callback: types.CallbackQuery):
     if task_id in tasks:
         del tasks[task_id]
         save_tasks(tasks)
-        # Отменяем задачу
         if task_id in running_tasks:
             running_tasks[task_id].cancel()
             del running_tasks[task_id]
@@ -305,7 +306,7 @@ async def delete_task(callback: types.CallbackQuery):
 # ======================
 
 async def main():
-    # Загружаем и возобновляем активные задачи
+    # Загружаем активные задачи
     tasks = load_tasks()
     for tid, task in tasks.items():
         if task.get("is_active") and task.get("sent_count", 0) < task.get("total_count", 0):
@@ -314,7 +315,6 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    # Запускаем userbot в фоне (авторизация при первом запуске)
-    userbot.start()
-    print("✅ Userbot готов.")
+    print("✅ Запуск бота...")
+    print(f"📁 Сессия: {'найдена' if os.path.exists('sender.session') else 'ОТСУТСТВУЕТ!'}")
     asyncio.run(main())
